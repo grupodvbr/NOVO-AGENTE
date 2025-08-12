@@ -7,8 +7,7 @@
     "start": "vercel dev"
   },
   "dependencies": {
-    "openai": "^4.67.2",
-    "ioredis": "^5.4.1"
+    "openai": "^4.67.2"
   },
   "engines": {
     "node": ">=18"
