@@ -13,8 +13,7 @@ const ALLOWLIST = (process.env.CORS_ALLOWLIST || DEFAULT_ALLOWLIST)
   .filter(Boolean);
 
 // URL da planilha de METAS
-const METAS_URL =
-  "https://script.google.com/macros/s/AKfycbzyiL6yNCj_FYWiQ2PS88mthToCvWM1wJ0q7CQy8asyg-59L8YezKzFY6d-lgQU0ni3/exec";
+const METAS_URL = "https://script.google.com/macros/s/AKfycbzyiL6yNCj_FYWiQ2PS88mthToCvWM1wJ0q7CQy8asyg-59L8YezKzFY6d-lgQU0ni3/exec";
 
 export default async function handler(req, res) {
   // ── CORS ───────────────────────────────────────────────────────────
@@ -30,9 +29,7 @@ export default async function handler(req, res) {
 
   // ── Segurança ──────────────────────────────────────────────────────
   if (!process.env.OPENAI_API_KEY) {
-    return res
-      .status(500)
-      .json({ ok: false, error: "OPENAI_API_KEY não configurada" });
+    return res.status(500).json({ ok: false, error: "OPENAI_API_KEY não configurada" });
   }
 
   // ── Entrada ────────────────────────────────────────────────────────
@@ -44,8 +41,7 @@ export default async function handler(req, res) {
   if (!q) {
     return res.status(400).json({
       ok: false,
-      error:
-        "Parametro 'q' é obrigatório (GET ?q=... ou POST { q: ... }).",
+      error: "Parametro 'q' é obrigatório (GET ?q=... ou POST { q: ... }).",
     });
   }
 
@@ -69,17 +65,14 @@ Regras:
 - Quando houver datas ou valores, use formato brasileiro (DD/MM/AAAA, R$ 0,00).
 - Quando não souber a resposta, informe que não tem certeza.
 - Não repita sempre a mesma pergunta, seja descontraído.
-- Quando o usuário pedir gráficos, gere HTML + JavaScript usando Chart.js, incluindo <canvas> e <script> prontos para uso.
-- O HTML retornado será exibido diretamente no navegador, portanto garanta que seja autossuficiente.
-- Use sempre os dados reais da planilha quando possível.
 
-📊 Dados de METAS disponíveis:
-${JSON.stringify(metasData)}
+Dados disponíveis para consulta:
+- METAS: ${JSON.stringify(metasData)}
     `;
 
     // 3️⃣ Chamar API OpenAI com os dados no contexto
     const response = await client.responses.create({
-      model: "gpt-4o-mini",
+      model: "gpt-4o-mini", // Modelo mais recente e rápido
       input: [
         { role: "system", content: systemPrompt },
         { role: "user", content: q },
@@ -87,16 +80,11 @@ ${JSON.stringify(metasData)}
       temperature: 0.3,
     });
 
-    // 🔹 IMPORTANTE: Agora a resposta pode conter HTML
-    const html = response.output_text ?? "";
+    const text = response.output_text ?? "";
+    return res.status(200).json({ ok: true, text, meta: { model: response.model } });
 
-    return res
-      .status(200)
-      .json({ ok: true, html, meta: { model: response.model } });
   } catch (err) {
     console.error("OpenAI error:", err);
-    return res
-      .status(500)
-      .json({ ok: false, error: String(err?.message || err) });
+    return res.status(500).json({ ok: false, error: String(err?.message || err) });
   }
 }
