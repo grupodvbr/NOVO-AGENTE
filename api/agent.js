@@ -1,7 +1,69 @@
 // api/agent.js
 import OpenAI from "openai";
+import { kv } from "@vercel/kv"; // Vercel KV (integração via Marketplace)
 
+// ====== OpenAI ======
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// ====== MEMÓRIA (KV) ======
+const KV_ON = Boolean(
+  (process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN) ||
+  // caso a integração tenha criado envs UPSTASH_*, o alias abaixo também liga a memória
+  (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN)
+);
+
+// ajuste como preferir
+const MEM_TTL   = 60 * 60 * 24 * 30; // 30 dias
+const MAX_TURNS = 12;                // últimas 12 trocas (user+bot)
+const kTurns = (id) => `mem:turns:${id}`;
+const kSum   = (id) => `mem:sum:${id}`;
+
+async function loadMemory(userId) {
+  if (!KV_ON || !userId) return { turns: [], summary: null };
+  const [turns, summary] = await Promise.all([
+    kv.lrange(kTurns(userId), -MAX_TURNS * 2, -1),
+    kv.get(kSum(userId)),
+  ]);
+  const parsed = (turns || []).map((s) => {
+    try { return JSON.parse(s); } catch { return null; }
+  }).filter(Boolean);
+  return { turns: parsed, summary: summary || null };
+}
+
+async function saveMemory(userId, userText, assistantText) {
+  if (!KV_ON || !userId) return;
+  const item = JSON.stringify({ u: userText, a: assistantText, t: Date.now() });
+  await kv.rpush(kTurns(userId), item);
+  await kv.expire(kTurns(userId), MEM_TTL);
+  await kv.ltrim(kTurns(userId), -MAX_TURNS * 2, -1);
+}
+
+async function clearMemory(userId) {
+  if (!KV_ON || !userId) return;
+  await Promise.all([kv.del(kTurns(userId)), kv.del(kSum(userId))]);
+}
+
+async function summarizeIfLarge(userId) {
+  if (!KV_ON || !userId) return;
+  const all = await kv.lrange(kTurns(userId), 0, -1);
+  if (!all || all.length < MAX_TURNS * 2) return;
+
+  const text = all.map((s) => {
+    try { const t = JSON.parse(s); return `U: ${t.u}\nA: ${t.a}`; } catch { return ""; }
+  }).join("\n\n");
+
+  const r = await client.responses.create({
+    model: "gpt-4o-mini",
+    input: [
+      { role: "system", content: "Resuma a conversa abaixo em até 6 linhas, guardando fatos persistentes (nome, preferências, empresas, metas, etc.)." },
+      { role: "user", content: text }
+    ],
+    temperature: 0.2,
+    metadata: { route: "memory.summarize" }
+  });
+  const summary = r.output_text?.trim();
+  if (summary) await kv.set(kSum(userId), summary, { ex: MEM_TTL });
+}
 
 // ---------- Utils ----------
 const TZ = "America/Sao_Paulo";
@@ -123,10 +185,8 @@ function resumoMes(rows, { mes, ano }) {
 function percentualDia(rows, { empresaKey, iso }) {
   const fil = rows.filter((r) => r.empresaKey === empresaKey && r.dataISO === iso);
   if (!fil.length) return null;
-  const prev = fil.reduce((s, x) => s + x.previsto, 0);      // cuidado: aqui é meta mensal por linha
+  const prev = fil.reduce((s, x) => s + x.previsto, 0);      // meta mensal por linha
   const rea  = fil.reduce((s, x) => s + x.realizado, 0);
-  // Como Previsto é mensal, para o dia o percentual fica “realizado vs meta mensal”.
-  // Se quiser, podemos dividir meta mensal por número de dias úteis — me avisa.
   return { previsto: prev, realizado: rea, pct: prev > 0 ? (rea / prev) * 100 : 0 };
 }
 
@@ -167,7 +227,7 @@ function mapOpenAIError(err) {
   return { ok:false, userMessage:"⚠️ Tive um problema ao processar agora. Tente novamente em instantes.", code:"GENERIC_ERROR" };
 }
 
-async function aiNLG({ instruction, context, route, from }) {
+async function aiNLG({ instruction, context, route, from, memory }) {
   const hoje = new Date().toLocaleString("pt-BR",{ timeZone: TZ });
   const system = [
     "Você é um analista do Grupo DV. Responda SEMPRE em Português do Brasil.",
@@ -176,10 +236,19 @@ async function aiNLG({ instruction, context, route, from }) {
     "Não invente números: use apenas os dados do contexto JSON."
   ].join("\n");
 
+  // histórico da memória para dar contexto ao modelo
+  const history = [];
+  if (memory?.summary) history.push({ role:"system", content:`Memória resumida do usuário: ${memory.summary}` });
+  for (const t of memory?.turns || []) {
+    if (t.u) history.push({ role:"user", content: t.u });
+    if (t.a) history.push({ role:"assistant", content: t.a });
+  }
+
   const r = await client.responses.create({
     model: "gpt-4o-mini",
     input: [
       { role: "system", content: system },
+      ...history,
       { role: "user", content:
 `Hoje é ${hoje}.
 
@@ -211,7 +280,14 @@ export default async function handler(req, res) {
       return res.status(400).json({ ok:false, error:"Missing 'q' string" });
     }
 
+    // comando para apagar memória
+    if (/^(apagar|limpar|esquecer).*(minha )?mem[oó]ria/i.test(q)) {
+      await clearMemory(from);
+      return res.status(200).json({ ok:true, text:"✅ Memória apagada." });
+    }
+
     const intent = detectIntent(q);
+    const memory = await loadMemory(from);
 
     // 1) % do dia X para uma empresa — usa IA para “narrar” o resultado
     if (intent.kind === "pctDia") {
@@ -228,8 +304,12 @@ export default async function handler(req, res) {
         instruction: `Explique, em poucas linhas, o desempenho do dia para a empresa informada. Mostre Previsto, Realizado e Percentual. Seja direto.`,
         context: { empresa, data: dia.iso, previsto: r.previsto, realizado: r.realizado, pct: r.pct },
         route: "metas.pctDia",
-        from
+        from,
+        memory
       });
+
+      await saveMemory(from, q, text);
+      await summarizeIfLarge(from);
       return res.status(200).json({ ok:true, text });
     }
 
@@ -247,8 +327,12 @@ export default async function handler(req, res) {
           empresas: sum.empresas
         },
         route: "metas.resumoMes",
-        from
+        from,
+        memory
       });
+
+      await saveMemory(from, q, text);
+      await summarizeIfLarge(from);
       return res.status(200).json({ ok:true, text });
     }
 
@@ -263,24 +347,41 @@ export default async function handler(req, res) {
         instruction: `Liste as empresas que bateram a meta no mês, com o percentual. Caso nenhuma tenha batido, diga isso claramente.`,
         context: { mes: mesRef.mes, ano: mesRef.ano, label: mesRef.label, bateu },
         route: "metas.quemBateu",
-        from
+        from,
+        memory
       });
+
+      await saveMemory(from, q, text);
+      await summarizeIfLarge(from);
       return res.status(200).json({ ok:true, text });
     }
 
-    // 4) fallback IA genérico
+    // 4) fallback IA genérico (com memória)
     const hoje = new Date().toLocaleString("pt-BR",{ timeZone: TZ });
+
+    const hist = [];
+    if (memory?.summary) hist.push({ role:"system", content:`Memória resumida do usuário: ${memory.summary}` });
+    for (const t of memory?.turns || []) {
+      if (t.u) hist.push({ role:"user", content: t.u });
+      if (t.a) hist.push({ role:"assistant", content: t.a });
+    }
+
     const r = await client.responses.create({
       model: "gpt-4o-mini",
       input: [
-        { role:"system", content: "Você é um assistente do Grupo DV. Responda em PT-BR, de forma objetiva." },
+        { role:"system", content: "Você é um assistente do Grupo DV. Use a memória abaixo quando for relevante. Responda em PT-BR, objetivo." },
+        ...hist,
         { role:"user", content: `${q}\n(Hoje é ${hoje})` }
       ],
       temperature: 0.3,
       metadata: { source:"whatsapp", prompt_id:"pmpt_123456", route:"fallback", from: from || "" }
     });
-    const text = r.output_text || "";
+    const text = r.output_text?.trim() || "";
+
+    await saveMemory(from, q, text);
+    await summarizeIfLarge(from);
     return res.status(200).json({ ok:true, text });
+
   } catch (err) {
     const mapped = mapOpenAIError(err);
     console.error("Agent error:", err?.message || err);
