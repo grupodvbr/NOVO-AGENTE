@@ -1,0 +1,16 @@
+{
+  "name": "agente-dv-openai",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vercel dev",
+    "build": "echo \"no build step\"",
+    "start": "vercel dev"
+  },
+  "dependencies": {
+    "openai": "^4.67.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
