@@ -2,7 +2,7 @@
 export default async function handler(req, res) {
   // ── CORS ──────────────────────────────────────────────────────────────
   // Troque pelo seu endereço do GitHub Pages:
-  const ALLOWED_ORIGIN = 'https://grupodvbr.github.io'; // <- ajuste aqui!
+  const ALLOWED_ORIGIN = 'https://grupodvbr.github.io/IA/'; // <- ajuste aqui!
   res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
