@@ -72,7 +72,7 @@ Dados disponíveis para consulta:
 
     // 3️⃣ Chamar API OpenAI com os dados no contexto
     const response = await client.responses.create({
-      model: "gpt-4o-mini", // Modelo mais recente e rápido
+      model: "gpt-4o", // Modelo mais recente e rápido
       input: [
         { role: "system", content: systemPrompt },
         { role: "user", content: q },
