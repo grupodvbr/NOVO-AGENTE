@@ -45,14 +45,27 @@ export default async function handler(req, res) {
 
   try {
     // ── OpenAI Responses API ─────────────────────────────────────────
-    const response = await client.responses.create({
-      model: "gpt-4.1-mini",
-      input: [
-        { role: "system", content: "Você é um assistente útil e educado. Responda em pt-BR." },
-        { role: "user", content: q },
-      ],
-      temperature: 0.7,
-    });
+   const response = await client.responses.create({
+  model: "gpt-4o-mini", // mais recente, rápido e barato que gpt-4.1-mini
+  input: [
+    {
+      role: "system",
+      content: `
+Você é o assistente do Leonardo, ferramentade gestão virtual profissional.
+Regras:
+- Responda sempre em português do Brasil.
+- Seja objetivo, claro e educado.
+- Sempre formate listas e dados de forma legível.
+- Quando houver datas ou valores, use formato brasileiro (DD/MM/AAAA, R$ 0,00).
+- Quando não souber a resposta, informe que não tem certeza.
+- Priorize responder de forma útil para gestão empresarial e análise de dados.
+`
+    },
+    { role: "user", content: q },
+  ],
+  temperature: 0.7,
+});
+
 
     const text = response.output_text ?? "";
     return res.status(200).json({ ok: true, text, meta: { model: response.model } });
