@@ -95,30 +95,50 @@ async function fetchMetas() {
 }
 
 // summaries
-function resumoMes(rows, {mes,ano}) {
-  const fil = rows.filter(r => r.mes===mes && r.ano===ano);
+// Substitua a função resumoMes existente por esta versão:
+function resumoMes(rows, { mes, ano }) {
+  // mantém apenas registros do mês/ano desejados
+  const fil = rows.filter((r) => r.mes === mes && r.ano === ano);
+
+  // agrega por empresa
   const map = new Map();
   for (const r of fil) {
     const k = r.empresaKey;
-    const agg = map.get(k) || { empresa:r.empresa, prev:0, real:0 };
-    agg.prev += r.previsto;
-    agg.real += r.realizado;
-    map.set(k, agg);
-  }
-  const empresas = [...map.values()].map(x => ({
-    empresa: x.empresa,
-    previsto: x.prev,
-    realizado: x.real,
-    pct: x.prev>0 ? (x.real/x.prev)*100 : 0,
-    bateu: x.prev>0 ? (x.real/x.prev)>=1 : false
-  })).sort((a,b)=>b.pct-a.pct);
+    let agg = map.get(k);
+    if (!agg) {
+      agg = { empresa: r.empresa, prevMensal: 0, realSum: 0 };
+      map.set(k, agg);
+    }
+    // soma do realizado no mês
+    agg.realSum += r.realizado;
 
-  const totalPrev = empresas.reduce((s,x)=>s+x.previsto,0);
-  const totalReal = empresas.reduce((s,x)=>s+x.realizado,0);
-  const totalPct = totalPrev>0 ? (totalReal/totalPrev)*100 : 0;
+    // Previsto é meta mensal repetida por dia -> pegue 1 valor para o mês.
+    // Estratégia: maior valor não-zero encontrado no mês.
+    if (r.previsto > agg.prevMensal) {
+      agg.prevMensal = r.previsto;
+    }
+  }
+
+  // monta lista final
+  const empresas = [...map.values()].map((e) => {
+    const pct = e.prevMensal > 0 ? (e.realSum / e.prevMensal) * 100 : 0;
+    return {
+      empresa: e.empresa,
+      previsto: e.prevMensal,       // meta mensal única
+      realizado: e.realSum,         // soma do mês
+      pct,
+      bateu: e.prevMensal > 0 ? e.realSum >= e.prevMensal : false,
+    };
+  }).sort((a, b) => b.pct - a.pct);
+
+  // totais do mês
+  const totalPrev = empresas.reduce((s, x) => s + x.previsto, 0);
+  const totalReal = empresas.reduce((s, x) => s + x.realizado, 0);
+  const totalPct = totalPrev > 0 ? (totalReal / totalPrev) * 100 : 0;
 
   return { empresas, totalPrev, totalReal, totalPct };
 }
+
 
 function percentualDia(rows, {empresaKey, iso}) {
   const fil = rows.filter(r => r.empresaKey===empresaKey && r.dataISO===iso);
