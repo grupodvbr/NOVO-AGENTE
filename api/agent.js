@@ -1,22 +1,98 @@
-// api/agent.js
-import OpenAI from "openai";
+// /api/agent.js
+// Runtime: Node.js (não Edge)
 
+// ====== deps ======
+import OpenAI from "openai";
+import Redis from "ioredis";
+
+// ====== OpenAI ======
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ---------- Utils ----------
-const TZ = "America/Sao_Paulo";
+// ====== Redis (memória) ======
+const redis = process.env.REDIS_URL_NOVO
+  ? new Redis(process.env.REDIS_URL_NOVO)  // rediss://default:senha@host:port
+  : null;
+
+const KV_ON = Boolean(redis);
+
+// adaptador compatível com o que usamos no código
+const kv = KV_ON
+  ? {
+      lrange: (k, s, e) => redis.lrange(k, s, e),
+      rpush: (k, v) => redis.rpush(k, v),
+      expire: (k, secs) => redis.expire(k, secs),
+      ltrim: (k, s, e) => redis.ltrim(k, s, e),
+      get: async (k) => {
+        const v = await redis.get(k);
+        try { return JSON.parse(v); } catch { return v; }
+      },
+      set: (k, val, opts = {}) => {
+        const payload = typeof val === "string" ? val : JSON.stringify(val);
+        return opts.ex ? redis.set(k, payload, "EX", opts.ex) : redis.set(k, payload);
+      },
+      del: (k) => redis.del(k),
+    }
+  : null;
+
+// ====== Memória ======
+const MEM_TTL   = 60 * 60 * 24 * 30; // 30 dias
+const MAX_TURNS = 12;                // últimas N trocas
+const kTurns = (id) => `mem:turns:${id}`;
+const kSum   = (id) => `mem:sum:${id}`;
+
+async function loadMemory(userId) {
+  if (!KV_ON || !userId) return { turns: [], summary: null };
+  const [turns, summary] = await Promise.all([
+    kv.lrange(kTurns(userId), -MAX_TURNS * 2, -1),
+    kv.get(kSum(userId)),
+  ]);
+  const parsed = (turns || [])
+    .map((s) => { try { return JSON.parse(s); } catch { return null; } })
+    .filter(Boolean);
+  return { turns: parsed, summary: summary || null };
+}
+
+async function saveMemory(userId, userText, assistantText) {
+  if (!KV_ON || !userId) return;
+  const item = JSON.stringify({ u: userText, a: assistantText, t: Date.now() });
+  await kv.rpush(kTurns(userId), item);
+  await kv.expire(kTurns(userId), MEM_TTL);
+  await kv.ltrim(kTurns(userId), -MAX_TURNS * 2, -1);
+}
+
+async function clearMemory(userId) {
+  if (!KV_ON || !userId) return;
+  await Promise.all([kv.del(kTurns(userId)), kv.del(kSum(userId))]);
+}
+
+async function summarizeIfLarge(userId) {
+  if (!KV_ON || !userId) return;
+  const all = await kv.lrange(kTurns(userId), 0, -1);
+  if (!all || all.length < MAX_TURNS * 2) return;
+
+  const text = all.map((s) => {
+    try { const t = JSON.parse(s); return `U: ${t.u}\nA: ${t.a}`; } catch { return ""; }
+  }).join("\n\n");
+
+  const r = await client.responses.create({
+    model: "gpt-4o-mini",
+    input: [
+      { role: "system", content: "Resuma a conversa abaixo em até 6 linhas, guardando fatos persistentes (nome, preferências, empresas, metas, etc.)." },
+      { role: "user", content: text }
+    ],
+    temperature: 0.2,
+    metadata: { route: "memory.summarize" }
+  });
+  const summary = r.output_text?.trim();
+  if (summary) await kv.set(kSum(userId), summary, { ex: MEM_TTL });
+}
+
+// ====== Utils ======
+const TZ = process.env.TZ || "America/Sao_Paulo";
 const mesesPT = ["janeiro","fevereiro","março","abril","maio","junho","julho","agosto","setembro","outubro","novembro","dezembro"];
 
-const toBRL = (n) => `R$ ${Number(n||0).toLocaleString("pt-BR",{minimumFractionDigits:2, maximumFractionDigits:2})}`;
-const toPct = (n) => `${Number(n||0).toLocaleString("pt-BR",{maximumFractionDigits:1})}%`;
-
 const strip = (s="") => s.normalize("NFD").replace(/\p{Diacritic}/gu,"").toUpperCase().trim();
-
-// datas
-const parseISO = (s) => {
-  const d = new Date(`${s}T00:00:00-03:00`);
-  return Number.isNaN(d.getTime()) ? null : d;
-};
+const parseISO = (s) => { const d = new Date(`${s}T00:00:00-03:00`); return Number.isNaN(d.getTime()) ? null : d; };
 const ymd = (d) => d.toISOString().slice(0,10);
 
 function getMesRef(txt="") {
@@ -46,7 +122,7 @@ function parseDia(txt="") {
   return null;
 }
 
-// ---------- Fetch & normalize ----------
+// ====== Dados (METAS) ======
 async function fetchMetas() {
   const url = process.env.METAS_URL;
   if (!url) throw new Error("METAS_URL não configurada");
@@ -79,14 +155,13 @@ async function fetchMetas() {
       dia: d.getDate(),
       empresa: Empresa.trim(),
       empresaKey: strip(Empresa),
-      previsto,                 // valor de META mensal (repetido por dia)
-      realizado                 // valor realizado do dia
+      previsto,     // meta mensal (repetida por linha/dia)
+      realizado     // realizado do dia
     });
   }
   return rows;
 }
 
-// ---- resumo corrigido: Previsto = meta mensal 1x; Realizado = soma do mês
 function resumoMes(rows, { mes, ano }) {
   const fil = rows.filter((r) => r.mes === mes && r.ano === ano);
   const map = new Map();
@@ -94,23 +169,14 @@ function resumoMes(rows, { mes, ano }) {
   for (const r of fil) {
     const k = r.empresaKey;
     let agg = map.get(k);
-    if (!agg) {
-      agg = { empresa: r.empresa, prevMensal: 0, realSum: 0 };
-      map.set(k, agg);
-    }
+    if (!agg) { agg = { empresa: r.empresa, prevMensal: 0, realSum: 0 }; map.set(k, agg); }
     agg.realSum += r.realizado;
     if (r.previsto > agg.prevMensal) agg.prevMensal = r.previsto; // pega 1 meta mensal
   }
 
   const empresas = [...map.values()].map((e) => {
     const pct = e.prevMensal > 0 ? (e.realSum / e.prevMensal) * 100 : 0;
-    return {
-      empresa: e.empresa,
-      previsto: e.prevMensal,
-      realizado: e.realSum,
-      pct,
-      bateu: e.prevMensal > 0 ? e.realSum >= e.prevMensal : false,
-    };
+    return { empresa: e.empresa, previsto: e.prevMensal, realizado: e.realSum, pct, bateu: e.realSum >= e.prevMensal };
   }).sort((a, b) => b.pct - a.pct);
 
   const totalPrev = empresas.reduce((s, x) => s + x.previsto, 0);
@@ -123,14 +189,12 @@ function resumoMes(rows, { mes, ano }) {
 function percentualDia(rows, { empresaKey, iso }) {
   const fil = rows.filter((r) => r.empresaKey === empresaKey && r.dataISO === iso);
   if (!fil.length) return null;
-  const prev = fil.reduce((s, x) => s + x.previsto, 0);      // cuidado: aqui é meta mensal por linha
+  const prev = fil.reduce((s, x) => s + x.previsto, 0); // meta mensal por linha
   const rea  = fil.reduce((s, x) => s + x.realizado, 0);
-  // Como Previsto é mensal, para o dia o percentual fica “realizado vs meta mensal”.
-  // Se quiser, podemos dividir meta mensal por número de dias úteis — me avisa.
   return { previsto: prev, realizado: rea, pct: prev > 0 ? (rea / prev) * 100 : 0 };
 }
 
-// ---------- Intents ----------
+// ====== Intents ======
 function detectIntent(qRaw) {
   const q = qRaw.trim();
   const qLow = q.toLowerCase();
@@ -141,21 +205,18 @@ function detectIntent(qRaw) {
     const empresa = m ? m[1].trim() : "";
     return { kind:"pctDia", args:{ dia:d, empresa } };
   }
-
   if (/quem.*bateu.*meta/i.test(qLow)) {
     const mesRef = getMesRef(qLow);
     return { kind:"quemBateu", args:{ mesRef } };
   }
-
   if (/metas|resumo/.test(qLow) && /m[eê]s/.test(qLow)) {
     const mesRef = getMesRef(qLow);
     return { kind:"resumoMes", args:{ mesRef } };
   }
-
   return { kind:"ai" };
 }
 
-// ---------- IA (Responses API) ----------
+// ====== IA helper (NLG) ======
 function mapOpenAIError(err) {
   const msg = String(err?.message || err || "");
   if (/insufficient_quota|exceeded your current quota|billing/i.test(msg)) {
@@ -167,7 +228,7 @@ function mapOpenAIError(err) {
   return { ok:false, userMessage:"⚠️ Tive um problema ao processar agora. Tente novamente em instantes.", code:"GENERIC_ERROR" };
 }
 
-async function aiNLG({ instruction, context, route, from }) {
+async function aiNLG({ instruction, context, route, from, memory }) {
   const hoje = new Date().toLocaleString("pt-BR",{ timeZone: TZ });
   const system = [
     "Você é um analista do Grupo DV. Responda SEMPRE em Português do Brasil.",
@@ -176,10 +237,18 @@ async function aiNLG({ instruction, context, route, from }) {
     "Não invente números: use apenas os dados do contexto JSON."
   ].join("\n");
 
+  const history = [];
+  if (memory?.summary) history.push({ role:"system", content:`Memória resumida do usuário: ${memory.summary}` });
+  for (const t of memory?.turns || []) {
+    if (t.u) history.push({ role:"user", content: t.u });
+    if (t.a) history.push({ role:"assistant", content: t.a });
+  }
+
   const r = await client.responses.create({
     model: "gpt-4o-mini",
     input: [
       { role: "system", content: system },
+      ...history,
       { role: "user", content:
 `Hoje é ${hoje}.
 
@@ -196,7 +265,7 @@ ${JSON.stringify(context)}` },
   return r.output_text?.trim() || "";
 }
 
-// ---------- Handler ----------
+// ====== handler ======
 export default async function handler(req, res) {
   try {
     if (req.method !== "POST") {
@@ -211,9 +280,16 @@ export default async function handler(req, res) {
       return res.status(400).json({ ok:false, error:"Missing 'q' string" });
     }
 
-    const intent = detectIntent(q);
+    // comandos de memória
+    if (/^(apagar|limpar|esquecer).*(minha )?mem[oó]ria/i.test(q)) {
+      await clearMemory(from);
+      return res.status(200).json({ ok:true, text:"✅ Memória apagada." });
+    }
 
-    // 1) % do dia X para uma empresa — usa IA para “narrar” o resultado
+    const intent = detectIntent(q);
+    const memory = await loadMemory(from);
+
+    // 1) % do dia
     if (intent.kind === "pctDia") {
       const rows = await fetchMetas();
       const { dia, empresa } = intent.args;
@@ -228,12 +304,16 @@ export default async function handler(req, res) {
         instruction: `Explique, em poucas linhas, o desempenho do dia para a empresa informada. Mostre Previsto, Realizado e Percentual. Seja direto.`,
         context: { empresa, data: dia.iso, previsto: r.previsto, realizado: r.realizado, pct: r.pct },
         route: "metas.pctDia",
-        from
+        from,
+        memory
       });
+
+      await saveMemory(from, q, text);
+      await summarizeIfLarge(from);
       return res.status(200).json({ ok:true, text });
     }
 
-    // 2) Resumo do mês — agrega e passa o JSON para a IA narrar
+    // 2) Resumo do mês
     if (intent.kind === "resumoMes") {
       const rows = await fetchMetas();
       const { mesRef } = intent.args;
@@ -247,12 +327,16 @@ export default async function handler(req, res) {
           empresas: sum.empresas
         },
         route: "metas.resumoMes",
-        from
+        from,
+        memory
       });
+
+      await saveMemory(from, q, text);
+      await summarizeIfLarge(from);
       return res.status(200).json({ ok:true, text });
     }
 
-    // 3) Quem bateu a meta — também “narrado” pela IA
+    // 3) Quem bateu
     if (intent.kind === "quemBateu") {
       const rows = await fetchMetas();
       const { mesRef } = intent.args;
@@ -263,24 +347,40 @@ export default async function handler(req, res) {
         instruction: `Liste as empresas que bateram a meta no mês, com o percentual. Caso nenhuma tenha batido, diga isso claramente.`,
         context: { mes: mesRef.mes, ano: mesRef.ano, label: mesRef.label, bateu },
         route: "metas.quemBateu",
-        from
+        from,
+        memory
       });
+
+      await saveMemory(from, q, text);
+      await summarizeIfLarge(from);
       return res.status(200).json({ ok:true, text });
     }
 
-    // 4) fallback IA genérico
+    // 4) fallback IA (com memória)
     const hoje = new Date().toLocaleString("pt-BR",{ timeZone: TZ });
+    const hist = [];
+    if (memory?.summary) hist.push({ role:"system", content:`Memória resumida do usuário: ${memory.summary}` });
+    for (const t of memory?.turns || []) {
+      if (t.u) hist.push({ role:"user", content: t.u });
+      if (t.a) hist.push({ role:"assistant", content: t.a });
+    }
+
     const r = await client.responses.create({
       model: "gpt-4o-mini",
       input: [
-        { role:"system", content: "Você é um assistente do Grupo DV. Responda em PT-BR, de forma objetiva." },
+        { role:"system", content: "Você é um assistente do Grupo DV. Use a memória abaixo quando for relevante. Responda em PT-BR, objetivo." },
+        ...hist,
         { role:"user", content: `${q}\n(Hoje é ${hoje})` }
       ],
       temperature: 0.3,
       metadata: { source:"whatsapp", prompt_id:"pmpt_123456", route:"fallback", from: from || "" }
     });
-    const text = r.output_text || "";
+    const text = r.output_text?.trim() || "";
+
+    await saveMemory(from, q, text);
+    await summarizeIfLarge(from);
     return res.status(200).json({ ok:true, text });
+
   } catch (err) {
     const mapped = mapOpenAIError(err);
     console.error("Agent error:", err?.message || err);
