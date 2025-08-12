@@ -1,0 +1,16 @@
+{
+  "name": "agente-dv",
+  "version": "1.0.0",
+  "description": "Agente DV usando OpenAI e hospedado no Vercel",
+  "main": "api/agent.js",
+  "scripts": {
+    "start": "vercel dev",
+    "build": "echo 'Nada para buildar'"
+  },
+  "dependencies": {
+    "node-fetch": "^3.3.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
