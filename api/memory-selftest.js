@@ -1,3 +1,4 @@
+// /api/memory-selftest.js
 import Redis from "ioredis";
 
 const url = process.env.REDIS_URL_NOVO; // mesmo nome que você criou na Vercel
