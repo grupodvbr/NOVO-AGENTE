@@ -13,3 +13,8 @@
     "node": ">=18"
   }
 }
+{
+  "dependencies": {
+    "ioredis": "^5.4.1"
+  }
+}
