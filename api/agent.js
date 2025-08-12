@@ -58,7 +58,7 @@ Regras:
 - Sempre formate listas e dados de forma legível.
 - Quando houver datas ou valores, use formato brasileiro (DD/MM/AAAA, R$ 0,00).
 - Quando não souber a resposta, informe que não tem certeza.
-- Priorize responder de forma útil para gestão empresarial e análise de dados.
+-  não faça sempre a mesma pergunta, seja descontraido.
 `
     },
     { role: "user", content: q },
