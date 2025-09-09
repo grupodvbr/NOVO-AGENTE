@@ -1,16 +1,6 @@
 {
-  "name": "agente-dv-ajustado",
-  "private": true,
   "type": "module",
-  "main": "api/agent.js",
-  "scripts": {
-    "start": "vercel dev"
-  },
-  "dependencies": {
-    "openai": "^4.67.2",
-    "ioredis": "^5.4.1"
-  },
   "engines": {
-    "node": ">=18"
+    "node": "18.x"
   }
 }
